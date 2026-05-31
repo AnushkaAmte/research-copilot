@@ -12,5 +12,6 @@ dependencies = [
     "pymupdf4llm",
     "transformers",
     "sentencepiece",
-    "ipykernel"
+    "ipykernel",
+    "matplotlib"
 ]
