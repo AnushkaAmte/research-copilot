@@ -9,7 +9,7 @@ from transformers import AutoTokenizer
 INPUT_DIR = Path("../../data/processed")
 OUTPUT_DIR = Path("../../data/chunks")
 config = configparser.ConfigParser()
-config.read('constants.ini')
+config.read('../constants.ini')
 
 
 MODEL_NAME = config.get('CHUNK', 'MODEL_NAME')
@@ -35,10 +35,10 @@ def clean_markdown(text):
 
     # remove references / acknowledgements
     stop_headers = [
-        r"^##\s+references",
-        r"^##\s+bibliography",
-        r"^##\s+acknowledg",
-    ]
+    r"^##\s+(?:\*\*)?references(?:\*\*)?",
+    r"^##\s+(?:\*\*)?bibliography(?:\*\*)?",
+    r"^##\s+(?:\*\*)?acknowledg(?:ement|ements)?(?:\*\*)?",
+]
 
     lines = text.split("\n")
 
@@ -75,15 +75,6 @@ def clean_markdown(text):
 # ---------------- HEADER PARSING ---------------- #
 
 def parse_sections(md_text):
-    """
-    Parse markdown headers into hierarchical sections.
-    Supports:
-    # title
-    ## section
-    ### subsection
-    """
-
-    pattern = r"^(#{1,3})\s+(.*)$"
 
     lines = md_text.split("\n")
 
@@ -94,15 +85,38 @@ def parse_sections(md_text):
 
     buffer = []
 
-    def flush_buffer():
-        nonlocal buffer, current_section, current_subsection
+    KNOWN_HEADERS = {
+        "abstract",
+        "introduction",
+        "background",
+        "related work",
+        "method",
+        "methods",
+        "approach",
+        "model architecture",
+        "training",
+        "experiments",
+        "results",
+        "evaluation",
+        "discussion",
+        "limitations",
+        "conclusion",
+        "references",
+        "appendix"
+    }
 
-        if not buffer:
-            return
+    def flush_buffer():
+        nonlocal buffer
 
         content = "\n".join(buffer).strip()
 
-        if content:
+        # don't create empty chunks and drop front matter sections with little content
+        if (
+            current_section is not None
+            and content
+            and len(content.split()) > 20
+            ):
+
             nodes.append({
                 "section": current_section,
                 "subsection": current_subsection,
@@ -113,23 +127,79 @@ def parse_sections(md_text):
 
     for line in lines:
 
-        match = re.match(pattern, line)
+        line = line.strip()
+
+        # markdown header
+        match = re.match(
+            r"^(#{1,6})\s+(.+)$",
+            line
+        )
 
         if match:
-            flush_buffer()
 
             level = len(match.group(1))
             title = match.group(2).strip()
 
-            if level == 2:
-                current_section = title
-                current_subsection = None
+            # remove markdown bold
+            title = re.sub(r"\*\*", "", title)
+            title = re.sub(r"\s+", " ", title)
 
-            elif level == 3:
-                current_subsection = title
+            title_lower = title.lower()
 
-        else:
-            buffer.append(line)
+            is_valid_header = False
+
+            numbering_match = re.match(
+                r"^(\d+(?:\.\d+)*)\s+(.+)$",
+                title
+            )
+
+            # ---------- NUMBERED HEADERS ----------
+            if numbering_match:
+
+                numbering = numbering_match.group(1)
+                depth = numbering.count(".")
+
+                is_valid_header = True
+
+                flush_buffer()
+
+                # 3 Title
+                if depth == 0:
+
+                    current_section = title
+                    current_subsection = None
+
+                # 3.1 Subtitle
+                elif depth == 1:
+
+                    current_subsection = title
+
+                # 3.2.1 Child subsection
+                elif depth >= 2:
+
+                    # keep under same subsection
+                    # append title into body for context
+                    buffer.append(f"\n{title}\n")
+
+                continue
+
+            # ---------- SEMANTIC HEADERS ----------
+            for known in KNOWN_HEADERS:
+                if known in title_lower:
+
+                    is_valid_header = True
+
+                    flush_buffer()
+
+                    current_section = title
+                    current_subsection = None
+                    break
+
+            if is_valid_header:
+                continue
+
+        # normal content
+        buffer.append(line)
 
     flush_buffer()
 
@@ -168,6 +238,109 @@ def chunk_tokens(text):
     return chunks
 
 
+def chunk_text_semantically(
+    text,
+    chunk_size=500,
+    overlap=75
+):
+    """
+    Paragraph-aware token chunking.
+
+    Strategy:
+    1. Split by paragraphs
+    2. Greedily pack paragraphs
+    3. Sliding window fallback for huge paragraphs
+    """
+
+    paragraphs = [
+        p.strip()
+        for p in text.split("\n\n")
+        if p.strip()
+    ]
+
+    chunks = []
+
+    current_chunk = []
+    current_tokens = 0
+
+    for para in paragraphs:
+
+        para_tokens = count_tokens(para)
+
+        # -------------------------------
+        # CASE 1: paragraph itself huge
+        # -------------------------------
+        if para_tokens > chunk_size:
+
+            # flush existing chunk first
+            if current_chunk:
+
+                chunks.append(
+                    "\n\n".join(current_chunk)
+                )
+
+                current_chunk = []
+                current_tokens = 0
+
+            tokens = tokenizer.encode(
+                para,
+                add_special_tokens=False
+            )
+
+            start = 0
+
+            while start < len(tokens):
+
+                end = start + chunk_size
+
+                chunk_tokens = tokens[start:end]
+
+                chunk_text = tokenizer.decode(
+                    chunk_tokens
+                )
+
+                chunks.append(chunk_text)
+
+                start += (
+                    chunk_size - overlap
+                )
+
+            continue
+
+        # -------------------------------
+        # CASE 2: greedy paragraph packing
+        # -------------------------------
+        if (
+            current_tokens + para_tokens
+            <= chunk_size
+        ):
+
+            current_chunk.append(para)
+            current_tokens += para_tokens
+
+        else:
+
+            chunks.append(
+                "\n\n".join(current_chunk)
+            )
+
+            current_chunk = [para]
+            current_tokens = para_tokens
+
+    # final chunk
+    if current_chunk:
+
+        chunks.append(
+            "\n\n".join(current_chunk)
+        )
+    if (
+    len(chunks) > 1
+    and count_tokens(chunks[-1]) < 150
+    ):
+        chunks[-2] += "\n\n" + chunks[-1]
+        chunks.pop()
+    return chunks
+
 # ---------------- MERGING ---------------- #
 
 def merge_small_subsections(nodes):
@@ -179,7 +352,7 @@ def merge_small_subsections(nodes):
     for node in nodes:
 
         token_count = count_tokens(node["text"])
-
+        #print(f"Section: {node['section']} | Subsection: {node['subsection']} | Tokens: {token_count}")
         if token_count >= MIN_SUBSECTION_TOKENS:
 
             if buffer:
@@ -202,7 +375,10 @@ def merge_small_subsections(nodes):
                     node["section"]
                 ):
 
-                    buffer["text"] += "\n\n" + node["text"]
+                    buffer["text"] += (
+                        f"\n\n{node['subsection']}\n\n"
+                        + node["text"]
+                    )
 
                 else:
 
@@ -236,7 +412,7 @@ for md_file in INPUT_DIR.glob("*.md"):
 
     for node in sections:
 
-        text_chunks = chunk_tokens(node["text"])
+        text_chunks =  chunk_text_semantically(node["text"])
 
         for chunk in text_chunks:
 
